@@ -1,0 +1,189 @@
+//@version=6
+strategy("D1 Bias + Persistent FVG Areas + H1 Retest Entries", overlay=true, initial_capital=100000, pyramiding=0, process_orders_on_close=true)
+
+riskPct = input.float(0.5, "Risk per Trade (%)", minval=0.05, step=0.05)
+fxPipBuffer = input.float(5.0, "FX Buffer (pips)", minval=0.0, step=0.5)
+indexPointBuffer = input.float(15.0, "NAS100 Buffer (points)", minval=0.0, step=0.5)
+oilPointBuffer = input.float(0.10, "USOIL Buffer (price)", minval=0.0, step=0.01)
+pivotLen = input.int(2, "D1 Pivot Length", minval=2, maxval=10)
+showDebug = input.bool(true, "Show Debug Labels")
+
+isNAS100 = str.contains(syminfo.ticker, "NAS100") or str.contains(syminfo.ticker, "USTEC")
+isUSOIL = str.contains(syminfo.ticker, "USOIL") or str.contains(syminfo.ticker, "WTI")
+isGU = str.contains(syminfo.ticker, "GBPUSD")
+allowedSymbol = isNAS100 or isUSOIL or isGU
+
+pipSize = syminfo.type == "forex" ? 0.0001 : syminfo.mintick
+slipBuffer = isGU ? fxPipBuffer * pipSize : isNAS100 ? indexPointBuffer : isUSOIL ? oilPointBuffer : 5.0 * syminfo.mintick
+
+// D1 data
+newD = ta.change(time("D")) != 0
+[dOpen, dHigh, dLow, dClose, dEMA200] = request.security(syminfo.tickerid, "D", [open, high, low, close, ta.ema(close, 200)])
+ph = request.security(syminfo.tickerid, "D", ta.pivothigh(high, pivotLen, pivotLen))
+pl = request.security(syminfo.tickerid, "D", ta.pivotlow(low, pivotLen, pivotLen))
+
+var float lastPH = na
+var float prevPH = na
+var float lastPL = na
+var float prevPL = na
+
+if not na(ph)
+    prevPH := lastPH
+    lastPH := ph
+if not na(pl)
+    prevPL := lastPL
+    lastPL := pl
+
+upTrendD1 = not na(lastPH) and not na(prevPH) and not na(lastPL) and not na(prevPL) and lastPH > prevPH and lastPL > prevPL
+downTrendD1 = not na(lastPH) and not na(prevPH) and not na(lastPL) and not na(prevPL) and lastPH < prevPH and lastPL < prevPL
+
+bullBias = upTrendD1 or dClose > dEMA200
+bearBias = downTrendD1 or dClose < dEMA200
+
+// D1 FVG definitions
+bullFvgD1 = dLow > dHigh[2]
+bullTop = dLow
+bullBot = dHigh[2]
+
+bearFvgD1 = dHigh < dLow[2]
+bearTop = dLow[2]
+bearBot = dHigh
+
+// Persistent stored zone
+var float zoneTop = na
+var float zoneBot = na
+var int zoneDir = 0
+
+// Mitigation rules
+bullMitigated = zoneDir == 1 and not na(zoneBot) and (dLow <= zoneBot or low <= zoneBot)
+bearMitigated = zoneDir == -1 and not na(zoneTop) and (dHigh >= zoneTop or high >= zoneTop)
+
+if bullMitigated or bearMitigated
+    zoneTop := na
+    zoneBot := na
+    zoneDir := 0
+
+// Store/replace persistent zones on new daily bar
+if newD
+    if bullFvgD1 and bullBias and (zoneDir == 0 or zoneDir == 1)
+        zoneTop := math.max(bullTop, bullBot)
+        zoneBot := math.min(bullTop, bullBot)
+        zoneDir := 1
+    if bearFvgD1 and bearBias and (zoneDir == 0 or zoneDir == -1)
+        zoneTop := math.max(bearTop, bearBot)
+        zoneBot := math.min(bearTop, bearBot)
+        zoneDir := -1
+
+// H1 touch logic
+zoneTouched = zoneDir != 0 and not na(zoneTop) and not na(zoneBot) and low <= zoneTop and high >= zoneBot
+
+// Fallback EMA pullback once per trend
+trendTag = bullBias and not bearBias ? 1 : bearBias and not bullBias ? -1 : 0
+
+emaTouched = low <= dEMA200 and high >= dEMA200
+fallbackLong = zoneDir == 0 and trendTag == 1 and emaTouched
+fallbackShort = zoneDir == 0 and trendTag == -1 and emaTouched
+
+// Prevent repeated fallback orders in same trend
+var bool usedFallbackLong = false
+var bool usedFallbackShort = false
+
+if ta.change(trendTag) != 0
+    if trendTag == 1
+        usedFallbackLong := false
+        usedFallbackShort := false
+    if trendTag == -1
+        usedFallbackShort := false
+        usedFallbackLong := false
+
+// Entry prices
+longEntry = zoneTop
+shortEntry = zoneBot
+fallbackLongEntry = dEMA200
+fallbackShortEntry = dEMA200
+
+// SL from zone/area end + buffer
+longSL = zoneDir == 1 ? zoneBot - slipBuffer : dEMA200 - slipBuffer
+shortSL = zoneDir == -1 ? zoneTop + slipBuffer : dEMA200 + slipBuffer
+
+capitalRisk = strategy.equity * (riskPct * 0.01)
+
+longRiskPerUnit = math.abs(longEntry - longSL)
+shortRiskPerUnit = math.abs(shortEntry - shortSL)
+fallbackLongRiskPerUnit = math.abs(fallbackLongEntry - (dEMA200 - slipBuffer))
+fallbackShortRiskPerUnit = math.abs(fallbackShortEntry - (dEMA200 + slipBuffer))
+
+longQty = longRiskPerUnit > 0 ? capitalRisk / longRiskPerUnit : na
+shortQty = shortRiskPerUnit > 0 ? capitalRisk / shortRiskPerUnit : na
+fallbackLongQty = fallbackLongRiskPerUnit > 0 ? capitalRisk / fallbackLongRiskPerUnit : na
+fallbackShortQty = fallbackShortRiskPerUnit > 0 ? capitalRisk / fallbackShortRiskPerUnit : na
+
+validTf = timeframe.isintraday and timeframe.multiplier == 60
+canTrade = allowedSymbol and validTf
+
+longRetestTrigger = canTrade and strategy.position_size == 0 and zoneDir == 1 and zoneTouched and not na(longQty)
+shortRetestTrigger = canTrade and strategy.position_size == 0 and zoneDir == -1 and zoneTouched and not na(shortQty)
+
+if longRetestTrigger
+    strategy.entry("L", strategy.long, qty=longQty, limit=longEntry)
+    label.new(bar_index, low, "Long retest", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0))
+
+if shortRetestTrigger
+    strategy.entry("S", strategy.short, qty=shortQty, limit=shortEntry)
+    label.new(bar_index, high, "Short retest", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0))
+
+if canTrade and strategy.position_size == 0 and fallbackLong and not usedFallbackLong and not na(fallbackLongQty)
+    strategy.entry("LFB", strategy.long, qty=fallbackLongQty, limit=fallbackLongEntry)
+    usedFallbackLong := true
+
+if canTrade and strategy.position_size == 0 and fallbackShort and not usedFallbackShort and not na(fallbackShortQty)
+    strategy.entry("SFB", strategy.short, qty=fallbackShortQty, limit=fallbackShortEntry)
+    usedFallbackShort := true
+
+// Management: TP1 at 2R, move to BE for runner
+var bool movedToBE = false
+if strategy.position_size == 0
+    movedToBE := false
+
+if strategy.position_size > 0
+    avg = strategy.position_avg_price
+    slActive = avg > dEMA200 ? longSL : dEMA200 - slipBuffer
+    r = math.abs(avg - slActive)
+    tp1 = avg + 2.0 * r
+    finalTp = not na(lastPH) ? lastPH : avg + 4.0 * r
+    strategy.exit("L-TP1", from_entry="L", limit=tp1, stop=slActive, qty_percent=50)
+    strategy.exit("LFB-TP1", from_entry="LFB", limit=tp1, stop=slActive, qty_percent=50)
+    if high >= tp1
+        movedToBE := true
+    runnerStop = movedToBE ? avg : slActive
+    strategy.exit("L-RUN", from_entry="L", limit=finalTp, stop=runnerStop, qty_percent=50)
+    strategy.exit("LFB-RUN", from_entry="LFB", limit=finalTp, stop=runnerStop, qty_percent=50)
+
+if strategy.position_size < 0
+    avg = strategy.position_avg_price
+    slActive = avg < dEMA200 ? shortSL : dEMA200 + slipBuffer
+    r = math.abs(slActive - avg)
+    tp1 = avg - 2.0 * r
+    finalTp = not na(lastPL) ? lastPL : avg - 4.0 * r
+    strategy.exit("S-TP1", from_entry="S", limit=tp1, stop=slActive, qty_percent=50)
+    strategy.exit("SFB-TP1", from_entry="SFB", limit=tp1, stop=slActive, qty_percent=50)
+    if low <= tp1
+        movedToBE := true
+    runnerStop = movedToBE ? avg : slActive
+    strategy.exit("S-RUN", from_entry="S", limit=finalTp, stop=runnerStop, qty_percent=50)
+    strategy.exit("SFB-RUN", from_entry="SFB", limit=finalTp, stop=runnerStop, qty_percent=50)
+
+// Visual buy/sell areas
+plot(dEMA200, "D1 EMA200", color=color.orange, linewidth=2)
+zTopPlot = plot(zoneDir != 0 ? zoneTop : na, "Stored Zone Top", color=color.new(color.blue, 0), style=plot.style_linebr)
+zBotPlot = plot(zoneDir != 0 ? zoneBot : na, "Stored Zone Bot", color=color.new(color.blue, 0), style=plot.style_linebr)
+fill(zTopPlot, zBotPlot, color=color.new(color.blue, 85), title="Stored Buy/Sell Area")
+
+plotshape(longRetestTrigger, title="Long Trigger", style=shape.triangleup, color=color.new(color.green, 0), location=location.belowbar, size=size.tiny, text="L")
+plotshape(shortRetestTrigger, title="Short Trigger", style=shape.triangledown, color=color.new(color.red, 0), location=location.abovebar, size=size.tiny, text="S")
+
+if showDebug and barstate.islast
+    label.new(bar_index, high, "Allowed: " + str.tostring(allowedSymbol) + "\nH1: " + str.tostring(validTf) + "\nZoneDir: " + str.tostring(zoneDir) + "\nZoneTouched: " + str.tostring(zoneTouched) + "\nBias: " + (trendTag == 1 ? "Bull" : trendTag == -1 ? "Bear" : "Neutral"), style=label.style_label_left, textcolor=color.white, color=color.new(color.black, 35))
+
+var string note = "Persistent D1 FVG area + H1 touch retest limits + EMA fallback entries."
+plotchar(na, title=note)
